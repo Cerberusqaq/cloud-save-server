@@ -1,6 +1,8 @@
 # 数据目录（账号与存档，绝不入库）
 data/
 build_tests/tmp-data/
+build_tests/tmp-media-data/
+build_tests/tmp-*/
 
 # 日志
 *.log
