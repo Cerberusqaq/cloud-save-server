@@ -1,0 +1,15 @@
+{
+  "name": "cloud-save-server",
+  "version": "1.0.0",
+  "description": "云存档中转服务器：接受客户端（个人知识工作台）打包上传的存档，按账号保存，密码仅以哈希存储与校验",
+  "main": "server.js",
+  "private": false,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "author": "Cerberusqaq",
+  "license": "MIT"
+}

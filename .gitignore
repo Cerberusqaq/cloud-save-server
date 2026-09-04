@@ -1,0 +1,7 @@
+# 数据目录（账号与存档，绝不入库）
+data/
+build_tests/tmp-data/
+
+# 日志
+*.log
+server.log
