@@ -37,11 +37,13 @@ const MAX_KEEP = parseInt(process.env.MAX_KEEP || '20', 10);
 const MAX_UPLOAD = parseInt(process.env.MAX_UPLOAD || (300 * 1024 * 1024), 10); // 300MB
 const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
 const ARCHIVES_DIR = path.join(DATA_DIR, 'archives');
+const MEDIA_DIR = path.join(DATA_DIR, 'media');
 const USERNAME_RE = /^[A-Za-z0-9_-]{1,32}$/;
 const HASH_RE = /^[0-9a-f]{16,128}$/i; // sha256 hex = 64；允许 scrypt 类更长
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(ARCHIVES_DIR, { recursive: true });
+fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
 /* ---------------- 账号存取（内存 + 原子落盘） ---------------- */
 let accounts = [];
@@ -58,6 +60,10 @@ function persistAccounts() {
 }
 function findUser(username) { return accounts.find((a) => a.username === username); }
 function userDir(username) { return path.join(ARCHIVES_DIR, username); }
+function mediaUserDir(username) { return path.join(MEDIA_DIR, username); }
+/** 校验文件名安全（防穿越），仅允许字母数字汉字 ._- 和空格，带音频扩展名 */
+const MEDIA_NAME_RE = /^[^\\/:*?"<>|\x00-\x1f]{1,120}\.(mp3|m4a|flac|wav|ogg|aac|opus)$/i;
+function safeMediaName(name) { return typeof name === 'string' && MEDIA_NAME_RE.test(name); }
 
 loadAccounts();
 
@@ -197,10 +203,16 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, deleted: id });
     }
 
+    /* ---- 云音乐库 ---- */
+    {
+      const mediaResult = handleMediaRoutes(req, res, pathname, query);
+      if (mediaResult !== null) return; // 已处理（注意 sendJson/stream 已响应）
+    }
+
     /* ---- 根信息 ---- */
     if (pathname === '/' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ service: 'cloud-save-server', version: '1.0.0', endpoints: ['/api/health', '/api/register', '/api/auth', '/api/save', '/api/archives', '/api/archive/latest', '/api/archive', 'DELETE /api/archive'] }));
+      res.end(JSON.stringify({ service: 'cloud-save-server', version: '1.0.0', endpoints: ['/api/health', '/api/register', '/api/auth', '/api/save', '/api/archives', '/api/archive/latest', '/api/archive', 'DELETE /api/archive', '/api/media', 'POST /api/media/upload', 'GET /api/media/download', 'DELETE /api/media'] }));
       return;
     }
 
@@ -251,16 +263,84 @@ function saveBodyToFile(req, dest) {
   });
 }
 
-function streamArchive(res, filePath, name) {
+function streamArchive(res, filePath, name, contentType = 'application/zip') {
+  const ext = path.extname(name).toLowerCase() || '.bin';
+  // Node 不允许 header 含非 ASCII；中文文件名用 RFC 5987 filename* 编码
   res.writeHead(200, {
-    'Content-Type': 'application/zip',
-    'Content-Disposition': `attachment; filename="${name}"`,
+    'Content-Type': contentType,
+    'Content-Disposition': `attachment; filename="file${ext}"; filename*=UTF-8''${encodeURIComponent(name)}`,
     'Content-Length': fs.statSync(filePath).size,
     'Cache-Control': 'no-store',
   });
   const stream = fs.createReadStream(filePath);
   stream.on('error', () => { try { res.destroy(); } catch (e) {} });
   stream.pipe(res);
+}
+
+/* ---------------- 云音乐库（媒体路由，复用账号鉴权） ---------------- */
+const MEDIA_MIME = { '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.flac': 'audio/flac', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.aac': 'audio/aac', '.opus': 'audio/opus' };
+
+function handleMediaRoutes(req, res, pathname, query) {
+  // POST /api/media/upload?username&passwordHash&name=xxx.mp3   body=音频二进制
+  if (pathname === '/api/media/upload' && req.method === 'POST') {
+    const u = getAuth(query);
+    if (!u) return sendJson(res, 401, { ok: false, error: '未授权' });
+    const name = String(query.name || '');
+    if (!safeMediaName(name)) return sendJson(res, 400, { ok: false, error: '文件名无效（需为音频文件，禁止路径字符）' });
+    const dir = mediaUserDir(u.username);
+    fs.mkdirSync(dir, { recursive: true });
+    return saveMediaUpload(req, res, path.join(dir, name), name, u);
+  }
+  // GET /api/media?username&passwordHash   列表
+  if (pathname === '/api/media' && req.method === 'GET') {
+    const u = getAuth(query);
+    if (!u) return sendJson(res, 401, { ok: false, error: '未授权' });
+    const dir = mediaUserDir(u.username);
+    let files = [];
+    if (fs.existsSync(dir)) {
+      files = fs.readdirSync(dir)
+        .filter((f) => safeMediaName(f))
+        .map((f) => {
+          const p = path.join(dir, f);
+          const st = fs.statSync(p);
+          return { name: f, size: st.size, mtime: st.mtimeMs };
+        })
+        .sort((a, b) => (a.mtime < b.mtime ? 1 : -1));
+    }
+    return sendJson(res, 200, { ok: true, username: u.username, files, totalBytes: files.reduce((s, f) => s + f.size, 0) });
+  }
+  // GET /api/media/download?username&passwordHash&name=xxx.mp3   下载
+  if (pathname === '/api/media/download' && req.method === 'GET') {
+    const u = getAuth(query);
+    if (!u) return sendJson(res, 401, { ok: false, error: '未授权' });
+    const name = String(query.name || '');
+    if (!safeMediaName(name)) return sendJson(res, 400, { ok: false, error: '文件名无效' });
+    const fp = path.join(mediaUserDir(u.username), name);
+    if (!fs.existsSync(fp)) return sendJson(res, 404, { ok: false, error: '文件不存在' });
+    const ext = path.extname(name).toLowerCase();
+    return streamArchive(res, fp, name, MEDIA_MIME[ext] || 'application/octet-stream');
+  }
+  // DELETE /api/media?username&passwordHash&name=xxx.mp3   删除
+  if (pathname === '/api/media' && req.method === 'DELETE') {
+    const u = getAuth(query);
+    if (!u) return sendJson(res, 401, { ok: false, error: '未授权' });
+    const name = String(query.name || '');
+    if (!safeMediaName(name)) return sendJson(res, 400, { ok: false, error: '文件名无效' });
+    const fp = path.join(mediaUserDir(u.username), name);
+    if (!fs.existsSync(fp)) return sendJson(res, 404, { ok: false, error: '文件不存在' });
+    fs.unlinkSync(fp);
+    return sendJson(res, 200, { ok: true, deleted: name });
+  }
+  return null; // 未匹配
+}
+
+function saveMediaUpload(req, res, dest, name, user) {
+  return saveBodyToFile(req, dest)
+    .then(({ bytes }) => {
+      if (bytes <= 0) { try { fs.unlinkSync(dest); } catch (e) {} return sendJson(res, 400, { ok: false, error: '内容为空' }); }
+      return sendJson(res, 200, { ok: true, username: user.username, bytes, name });
+    })
+    .catch((e) => { try { fs.unlinkSync(dest); } catch (x) {} sendJson(res, 400, { ok: false, error: e.message }); });
 }
 
 server.listen(PORT, '0.0.0.0', () => {

@@ -59,6 +59,10 @@ node -e "console.log(require('crypto').createHash('sha256').update('kwt-cloud:'+
 | GET | `/api/archive/latest?username&passwordHash` | 下载最新存档压缩包 |
 | GET | `/api/archive?username&passwordHash&id=<id>` | 下载指定版本 |
 | DELETE | `/api/archive?username&passwordHash&id=<id>` | 删除指定版本 |
+| POST | `/api/media/upload?username&passwordHash&name=<文件名.mp3>` | 上传音频文件（body 二进制，可含中文名），同名覆盖 |
+| GET | `/api/media?username&passwordHash` | 云音乐库列表（按时间倒序） |
+| GET | `/api/media/download?username&passwordHash&name=<名>` | 下载音频（按需播放） |
+| DELETE | `/api/media?username&passwordHash&name=<名>` | 删除云音乐 |
 
 ### curl 示例
 
