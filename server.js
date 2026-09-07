@@ -80,6 +80,11 @@ function getAuth(query) {
   if (!u || u.passwordHash !== passwordHash) return null;
   return u;
 }
+/** 管理员鉴权：账号存在、凭据正确且 accounts.json 中该账号 admin:true */
+function adminAuth(query) {
+  const u = getAuth(query);
+  return u && u.admin ? u : null;
+}
 function listVersions(username) {
   const dir = userDir(username);
   if (!fs.existsSync(dir)) return [];
@@ -201,6 +206,125 @@ const server = http.createServer(async (req, res) => {
       if (!fs.existsSync(fp)) return sendJson(res, 404, { ok: false, error: '存档不存在' });
       fs.unlinkSync(fp);
       return sendJson(res, 200, { ok: true, deleted: id });
+    }
+
+    /* ================= 管理员接口（账号在 data/accounts.json 标记 "admin": true） =================
+     * 管理员用本人账号凭据即可查看/管理所有用户：
+     *   GET    /api/admin/users                       所有用户列表（含曲库/存档统计）
+     *   GET    /api/admin/media?target=USER           指定用户的云曲库列表
+     *   GET    /api/admin/media/download?target&name  下载该用户的歌曲
+     *   POST   /api/admin/media/upload?target&name    上传/覆盖该用户的歌曲（body=音频二进制）
+     *   DELETE /api/admin/media?target&name           删除该用户的歌曲
+     *   GET    /api/admin/archives?target             该用户的存档版本列表
+     *   GET    /api/admin/archive/latest?target       下载该用户最新存档
+     *   DELETE /api/admin/archive?target&id           删除该用户的某版本存档
+     *   POST   /api/admin/archive/save?target         替该用户保存新存档版本（body=zip）
+     * 鉴权：query.username / query.passwordHash 必须是标记了 admin 的账号。
+     */
+    if (pathname.startsWith('/api/admin/')) {
+      const au = adminAuth(query);
+      if (!au) return sendJson(res, 401, { ok: false, error: '需要管理员账号' });
+      const target = String(query.target || au.username).trim();
+      if (!USERNAME_RE.test(target)) return sendJson(res, 400, { ok: false, error: '目标用户名无效' });
+
+      if (pathname === '/api/admin/users' && req.method === 'GET') {
+        const users = accounts.map((a) => {
+          let mediaCount = 0, mediaBytes = 0;
+          const md = mediaUserDir(a.username);
+          if (fs.existsSync(md)) {
+            for (const f of fs.readdirSync(md)) {
+              if (!safeMediaName(f)) continue;
+              mediaCount++;
+              mediaBytes += fs.statSync(path.join(md, f)).size;
+            }
+          }
+          return {
+            username: a.username, admin: !!a.admin, createdAt: a.createdAt,
+            lastSaveAt: a.lastSaveAt, saves: listVersions(a.username).length,
+            mediaCount, mediaBytes,
+          };
+        });
+        return sendJson(res, 200, { ok: true, admin: au.username, users });
+      }
+
+      /* ---- 用户云曲库 ---- */
+      if (pathname === '/api/admin/media' && req.method === 'GET') {
+        const dir = mediaUserDir(target);
+        const files = fs.existsSync(dir)
+          ? fs.readdirSync(dir).filter((f) => safeMediaName(f)).map((f) => {
+              const p = path.join(dir, f);
+              const st = fs.statSync(p);
+              return { name: f, size: st.size, mtime: st.mtimeMs };
+            }).sort((a, b) => (a.mtime < b.mtime ? 1 : -1))
+          : [];
+        return sendJson(res, 200, { ok: true, username: target, files, totalBytes: files.reduce((s, f) => s + f.size, 0) });
+      }
+      if (pathname === '/api/admin/media/download' && req.method === 'GET') {
+        const name = String(query.name || '');
+        if (!safeMediaName(name)) return sendJson(res, 400, { ok: false, error: '文件名无效' });
+        const fp = path.join(mediaUserDir(target), name);
+        if (!fs.existsSync(fp)) return sendJson(res, 404, { ok: false, error: '文件不存在' });
+        return streamArchive(res, fp, name, MEDIA_MIME[path.extname(name).toLowerCase()] || 'application/octet-stream');
+      }
+      if (pathname === '/api/admin/media/upload' && req.method === 'POST') {
+        const name = String(query.name || '');
+        if (!safeMediaName(name)) return sendJson(res, 400, { ok: false, error: '文件名无效（需为音频文件，禁止路径字符）' });
+        const dir = mediaUserDir(target);
+        fs.mkdirSync(dir, { recursive: true });
+        const dest = path.join(dir, name);
+        try {
+          const { bytes } = await saveBodyToFile(req, dest);
+          if (bytes <= 0) { try { fs.unlinkSync(dest); } catch (e) {} return sendJson(res, 400, { ok: false, error: '内容为空' }); }
+          return sendJson(res, 200, { ok: true, username: target, name, bytes });
+        } catch (e) {
+          try { fs.unlinkSync(dest); } catch (x) {}
+          return sendJson(res, 400, { ok: false, error: e.message });
+        }
+      }
+      if (pathname === '/api/admin/media' && req.method === 'DELETE') {
+        const name = String(query.name || '');
+        if (!safeMediaName(name)) return sendJson(res, 400, { ok: false, error: '文件名无效' });
+        const fp = path.join(mediaUserDir(target), name);
+        if (!fs.existsSync(fp)) return sendJson(res, 404, { ok: false, error: '文件不存在' });
+        fs.unlinkSync(fp);
+        return sendJson(res, 200, { ok: true, username: target, deleted: name });
+      }
+
+      /* ---- 用户云存档 ---- */
+      if (pathname === '/api/admin/archives' && req.method === 'GET') {
+        return sendJson(res, 200, { ok: true, username: target, versions: listVersions(target) });
+      }
+      if (pathname === '/api/admin/archive/latest' && req.method === 'GET') {
+        const versions = listVersions(target);
+        if (!versions.length) return sendJson(res, 404, { ok: false, error: '该账号暂无存档' });
+        return streamArchive(res, path.join(userDir(target), versions[versions.length - 1].name), versions[versions.length - 1].name);
+      }
+      if (pathname === '/api/admin/archive' && req.method === 'DELETE') {
+        const id = String(query.id || '');
+        if (!/^save-.+\.zip$/.test(id) || id.includes('..') || id.includes('/') || id.includes('\\')) return sendJson(res, 400, { ok: false, error: 'id 无效' });
+        const fp = path.join(userDir(target), id);
+        if (!fs.existsSync(fp)) return sendJson(res, 404, { ok: false, error: '存档不存在' });
+        fs.unlinkSync(fp);
+        return sendJson(res, 200, { ok: true, username: target, deleted: id });
+      }
+      if (pathname === '/api/admin/archive/save' && req.method === 'POST') {
+        const dir = userDir(target);
+        fs.mkdirSync(dir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/:/g, '-');
+        const dest = path.join(dir, `save-${stamp}.zip`);
+        try {
+          const { bytes } = await saveBodyToFile(req, dest);
+          if (bytes <= 0) { try { fs.unlinkSync(dest); } catch (e) {} return sendJson(res, 400, { ok: false, error: '上传内容为空' }); }
+          trimVersions(target);
+          const u = findUser(target);
+          if (u) { u.lastSaveAt = new Date().toISOString(); u.updatedAt = u.lastSaveAt; persistAccounts(); }
+          return sendJson(res, 200, { ok: true, username: target, bytes, savedAt: (u && u.lastSaveAt) || null, file: path.basename(dest) });
+        } catch (e) {
+          try { fs.unlinkSync(dest); } catch (x) {}
+          return sendJson(res, 400, { ok: false, error: e.message });
+        }
+      }
+      return sendJson(res, 404, { ok: false, error: '管理员接口不存在' });
     }
 
     /* ---- 云音乐库 ---- */
