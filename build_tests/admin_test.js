@@ -109,6 +109,13 @@ const B = 'username=bob&passwordHash=' + bobHash;         // 普通用户
     const buf = Buffer.from(await res.arrayBuffer());
     if (res.status !== 200 || buf.toString() !== zip2.toString()) throw new Error('最新版本内容不一致');
   });
+  await t('按 id 下载 bob 的指定版本', async () => {
+    const { j: list } = await jsonReq('GET', `/api/admin/archives?${A}&target=bob`);
+    const id = list.versions[list.versions.length - 1].id; // 最新一版
+    const res = await fetch(base + `/api/admin/archive?${A}&target=bob&id=${encodeURIComponent(id)}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (res.status !== 200 || buf.toString() !== zip2.toString()) throw new Error('按 id 下载内容不一致');
+  });
   await t('管理员删除 bob 的一个存档版本', async () => {
     const { j: list } = await jsonReq('GET', `/api/admin/archives?${A}&target=bob`);
     if (list.versions.length !== 2) throw new Error('应 2 个版本, got ' + list.versions.length);

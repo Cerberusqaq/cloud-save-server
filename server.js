@@ -299,6 +299,13 @@ const server = http.createServer(async (req, res) => {
         if (!versions.length) return sendJson(res, 404, { ok: false, error: '该账号暂无存档' });
         return streamArchive(res, path.join(userDir(target), versions[versions.length - 1].name), versions[versions.length - 1].name);
       }
+      if (pathname === '/api/admin/archive' && req.method === 'GET') {
+        const id = String(query.id || '');
+        if (!/^save-.+\.zip$/.test(id) || id.includes('..') || id.includes('/') || id.includes('\\')) return sendJson(res, 400, { ok: false, error: 'id 无效' });
+        const fp = path.join(userDir(target), id);
+        if (!fs.existsSync(fp)) return sendJson(res, 404, { ok: false, error: '存档不存在' });
+        return streamArchive(res, fp, id);
+      }
       if (pathname === '/api/admin/archive' && req.method === 'DELETE') {
         const id = String(query.id || '');
         if (!/^save-.+\.zip$/.test(id) || id.includes('..') || id.includes('/') || id.includes('\\')) return sendJson(res, 400, { ok: false, error: 'id 无效' });
